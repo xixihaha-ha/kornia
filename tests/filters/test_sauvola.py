@@ -20,6 +20,7 @@ import torch
 
 from kornia.core.exceptions import BaseError
 from kornia.filters import SauvolaThreshold, sauvola_threshold
+from kornia.filters.sauvola import _local_mean_variance
 
 from testing.base import DYNAMO_UNAVAILABLE_REASON, BaseTester, dynamo_is_available
 
@@ -89,8 +90,8 @@ class TestSauvolaThreshold(BaseTester):
     def test_constant_value_and_backward(self, device, dtype, value):
         image = torch.full((1, 1, 7, 9), value, device=device, dtype=dtype, requires_grad=True)
         mask, threshold = sauvola_threshold(image, 3)
-        expected = (image.double() * 0.8).to(threshold.dtype)
-        self.assert_close(threshold, expected, atol=0, rtol=0)
+        expected = (image.detach().cpu().double() * 0.8).to(threshold.dtype)
+        self.assert_close(threshold.cpu(), expected, atol=0, rtol=0)
         self.assert_close(mask.cpu(), image.cpu().double() > expected)
         threshold.sum().backward()
         assert image.grad is not None
@@ -104,6 +105,36 @@ class TestSauvolaThreshold(BaseTester):
         image[..., 0, 0] = 0
         _, threshold = sauvola_threshold(image, 31)
         self.assert_close(threshold[..., 16:, 16:], torch.full((1, 1, 112, 112), 0.8), atol=0, rtol=0)
+
+    @pytest.mark.parametrize("window_size", [(3, 3), (15, 31)])
+    def test_large_flat_region_float32_statistics(self, device, window_size):
+        # Exercise the accelerator algorithm directly on CPU too: a float64 CPU
+        # fallback must not hide cancellation in the float32 implementation.
+        image = torch.full((1, 1, 1024, 1024), 0.7, device=device)
+        image[..., 0, 0] = 0
+        mean, variance = _local_mean_variance(image, *window_size)
+        self.assert_close(mean[..., 16:, 16:], image[..., 16:, 16:], atol=0, rtol=0)
+        self.assert_close(variance[..., 16:, 16:], torch.zeros_like(variance[..., 16:, 16:]), atol=0, rtol=0)
+        _, threshold = sauvola_threshold(image, window_size)
+        self.assert_close(threshold[..., 16:, 16:], image[..., 16:, 16:] * 0.8, atol=2e-6, rtol=0)
+
+    @pytest.mark.parametrize("window_size", [(1, 3), (3, 5), (5, 1)])
+    def test_centered_statistics_reference_and_gradient(self, device, window_size):
+        image = torch.linspace(0.1, 0.9, 63, device=device).reshape(1, 1, 7, 9).requires_grad_()
+        kh, kw = window_size
+        padded = torch.nn.functional.pad(
+            image.detach().cpu().double(), (kw // 2, kw // 2, kh // 2, kh // 2), mode="reflect"
+        )
+        windows = padded.unfold(-2, kh, 1).unfold(-2, kw, 1)
+        mean, variance = _local_mean_variance(image, kh, kw)
+        self.assert_close(mean.cpu().double(), windows.mean((-2, -1)), atol=1e-7, rtol=1e-6)
+        self.assert_close(variance.cpu().double(), windows.var((-2, -1), correction=0), atol=1e-7, rtol=1e-6)
+        (mean.sum() + variance.sum()).backward()
+        reference = image.detach().cpu().double().requires_grad_()
+        patches = torch.nn.functional.pad(reference, (kw // 2, kw // 2, kh // 2, kh // 2), mode="reflect")
+        patches = patches.unfold(-2, kh, 1).unfold(-2, kw, 1)
+        (patches.mean((-2, -1)).sum() + patches.var((-2, -1), correction=0).sum()).backward()
+        self.assert_close(image.grad.cpu().double(), reference.grad, atol=2e-6, rtol=2e-6)
 
     def test_uint8_scale(self, device):
         image = torch.arange(63, device=device, dtype=torch.uint8).reshape(1, 1, 7, 9) * 4
@@ -160,6 +191,16 @@ class TestSauvolaThreshold(BaseTester):
             actual = sauvola_threshold(image, 3)
         self.assert_close(actual[0], expected[0])
         self.assert_close(actual[1], expected[1], atol=0, rtol=0)
+
+    @pytest.mark.skipif(not dynamo_is_available(), reason=DYNAMO_UNAVAILABLE_REASON)
+    def test_centered_statistics_dynamo(self, device, torch_optimizer):
+        image = torch.linspace(0.1, 0.9, 63, device=device).reshape(1, 1, 7, 9)
+        optimized = torch_optimizer(_local_mean_variance, fullgraph=True)
+        for data in (image, torch.full_like(image, 0.7)):
+            actual = optimized(data, 3, 5)
+            expected = _local_mean_variance(data, 3, 5)
+            for output, reference in zip(actual, expected):
+                self.assert_close(output, reference, atol=1e-7, rtol=1e-6)
 
     @pytest.mark.skipif(not dynamo_is_available(), reason=DYNAMO_UNAVAILABLE_REASON)
     def test_dynamo(self, device, dtype, torch_optimizer):

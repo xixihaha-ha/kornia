@@ -30,6 +30,29 @@ from .kernels import _check_kernel_size, _unpack_2d_ks
 __all__ = ["SauvolaThreshold", "sauvola_threshold"]
 
 
+def _local_mean_variance(input: torch.Tensor, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # Reduce one window axis at a time, without materializing full 2D patches.
+    # Explicit slices also support legacy ONNX export after reflection padding.
+    padded_rows = F.pad(input, (width // 2, width // 2, 0, 0), mode="reflect")
+    rows = torch.stack([padded_rows[..., i : i + input.shape[-1]] for i in range(width)], dim=-1)
+    row_offset = rows[..., :1]
+    row_delta = rows - row_offset
+    row_mean_delta = row_delta.mean(-1, keepdim=True)
+    row_mean = (row_offset + row_mean_delta).squeeze(-1)
+    row_variance = (row_delta - row_mean_delta).square().mean(-1)
+    padded_columns = F.pad(row_mean, (0, 0, height // 2, height // 2), mode="reflect")
+    columns = torch.stack([padded_columns[..., i : i + input.shape[-2], :] for i in range(height)], dim=-1)
+    column_offset = columns[..., :1]
+    column_delta = columns - column_offset
+    column_mean_delta = column_delta.mean(-1, keepdim=True)
+    mean = (column_offset + column_mean_delta).squeeze(-1)
+    between_rows = (column_delta - column_mean_delta).square().mean(-1)
+    within_rows = F.pad(row_variance, (0, 0, height // 2, height // 2), mode="reflect")
+    within_rows = torch.stack([within_rows[..., i : i + input.shape[-2], :] for i in range(height)], dim=-1)
+    variance = within_rows.mean(-1) + between_rows
+    return mean, variance
+
+
 def sauvola_threshold(
     input: torch.Tensor,
     window_size: tuple[int, int] | int = 15,
@@ -53,7 +76,8 @@ def sauvola_threshold(
           images; pass the same ``r`` to both libraries when comparing.
         - The threshold has the input shape and device, and dtype float64 for float64 input,
           float32 otherwise. Moments use float64 accumulation on CPU and for float64 input, float32
-          otherwise, with autocast disabled. Thresholds are differentiable for floating inputs; the hard mask is not.
+          otherwise, with autocast disabled. Accelerators use centered local reductions to avoid
+          cancellation of image-sized sums. Thresholds are differentiable for floating inputs; the hard mask is not.
           At zero local variance, the standard deviation's derivative is defined as zero.
 
     Args:
@@ -97,25 +121,28 @@ def sauvola_threshold(
         return input > values, values
 
     with torch.autocast(device_type=input.device.type, enabled=False):
-        # Float64 cumulative sums on CPU avoid losing low local variance when subtracting
-        # image-sized sums. Other accelerators keep float32 unless the input is float64.
-        accumulation_dtype = torch.float64 if input.device.type == "cpu" else values.dtype
-        data = values.to(accumulation_dtype)
-        offset = data[..., :1, :1]
-        centered = data - offset
-        moments = torch.cat((centered, centered.square()), dim=1)
-        padded = F.pad(moments, (width // 2, width // 2, height // 2, height // 2), mode="reflect")
-        # Leading zeros turn each window sum into four summed-area table reads. The
-        # work per output pixel is independent of window area; no patch tensor is built.
-        integral = F.pad(padded.cumsum(-1).cumsum(-2), (1, 0, 1, 0))
-        sums = integral[..., height:, width:] - integral[..., :-height, width:]
-        sums = sums - integral[..., height:, :-width] + integral[..., :-height, :-width]
-        mean, mean_square = (sums / (height * width)).chunk(2, dim=1)
-        variance = mean_square - mean.square()
+        if input.device.type == "cpu":
+            # CPU float64 summed-area tables retain the existing fast window sums.
+            accumulation_dtype = torch.float64
+            data = values.to(accumulation_dtype)
+            offset = data[..., :1, :1]
+            centered = data - offset
+            moments = torch.cat((centered, centered.square()), dim=1)
+            padded = F.pad(moments, (width // 2, width // 2, height // 2, height // 2), mode="reflect")
+            # Leading zeros turn each window sum into four summed-area table reads. The
+            # work per output pixel is independent of window area; no patch tensor is built.
+            integral = F.pad(padded.cumsum(-1).cumsum(-2), (1, 0, 1, 0))
+            sums = integral[..., height:, width:] - integral[..., :-height, width:]
+            sums = sums - integral[..., height:, :-width] + integral[..., :-height, :-width]
+            mean, mean_square = (sums / (height * width)).chunk(2, dim=1)
+            variance = mean_square - mean.square()
+            mean = mean + offset
+        else:
+            mean, variance = _local_mean_variance(values, height, width)
         positive = variance > 0
         # Avoid sqrt(0) in the differentiated branch, including on torch 2.5.1.
         std = torch.where(positive, torch.where(positive, variance, 1.0).sqrt(), 0.0)
-        threshold = ((mean + offset) * (1.0 + k * (std / r - 1.0))).to(values.dtype)
+        threshold = (mean * (1.0 + k * (std / r - 1.0))).to(values.dtype)
     return values > threshold, threshold
 
 
